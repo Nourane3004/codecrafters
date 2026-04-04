@@ -1,0 +1,22 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+exifread>=3.0.0
+python-whois>=0.9.4
+pytesseract>=0.3.10
+Pillow>=10.0.0
+opencv-python-headless>=4.9.0
+pydantic>=2.0.0
+
+# Document branch
+PyMuPDF>=1.24.0          # primary PDF text + layout extraction
+pdfplumber>=0.11.0       # fallback PDF extractor
+python-docx>=1.1.0       # DOCX text, layout, and metadata
+
+# Video branch
+openai-whisper>=20231117 # ASR transcription with timestamps
+# FFmpeg + FFprobe must be installed as system binaries:
+#   Ubuntu/Debian:  sudo apt install ffmpeg
+#   macOS:          brew install ffmpeg
