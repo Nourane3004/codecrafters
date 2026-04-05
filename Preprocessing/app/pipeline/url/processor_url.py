@@ -18,7 +18,7 @@ import httpx
 import whois
 from bs4 import BeautifulSoup
 
-from Preprocessing.app.models.feature_object import (
+from app.models.feature_object import (
     DomainInfo,
     InputType,
     MetaExtract,

@@ -147,16 +147,20 @@ class SourceCredibilityAgent:
 
     def _extract_domain(self, nfo: Any) -> Optional[str]:
         """Extrait le nom de domaine à partir du NFO."""
-        if nfo.input_type == "URL" and nfo.url_data and nfo.url_data.final_url:
+        # FIX: InputType enum values are lowercase ("url", "image", etc.).
+        # Comparing against uppercase literals "URL" / "IMAGE" always evaluated
+        # to False, so domain extraction was silently skipped for every input.
+        input_type_val = nfo.input_type.value if hasattr(nfo.input_type, "value") else str(nfo.input_type)
+
+        if input_type_val == "url" and nfo.url_data and nfo.url_data.final_url:  # FIXED
             from urllib.parse import urlparse
             parsed = urlparse(nfo.url_data.final_url)
             domain = parsed.netloc
             if domain.startswith("www."):
                 domain = domain[4:]
             return domain
-        # Pour les autres types, on peut essayer de trouver un domaine dans les métadonnées
-        if nfo.input_type == "IMAGE" and nfo.image_meta and nfo.image_meta.exif:
-            # Exemple : exif peut contenir un champ "source" ou "url"
+        # For non-URL types, check if source_ref looks like a URL
+        if input_type_val == "image" and nfo.image_meta and nfo.image_meta.exif:  # FIXED
             pass
         return None
 

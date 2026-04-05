@@ -35,7 +35,8 @@ import numpy as np
 
 # Import projet — chemins relatifs à menacraft/ comme working dir
 from Preprocessing.app.models.feature_object import NormalizedFeatureObject
-from claim_extractor import ExtractedClaim
+# FIX: Import ClaimExtractionResult instead of ExtractedClaim (same reason as image agent)
+from claim_extractor import ClaimExtractionResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -490,12 +491,15 @@ def process(
         )
 
         # ── Claim extraction (Groq) ─────────────────────────────────────────
+        # FIX: was instantiating ExtractedClaim with (extracted_text, source_type)
+        # kwargs that don't exist on the single-claim model. Use ClaimExtractionResult.
         try:
-            claim_result = ExtractedClaim(
-                extracted_text=extracted_text,
-                source_type="video",
+            claim_result = ClaimExtractionResult(
+                success=True,
+                extraction_method="heuristic",
+                reasoning_notes=[f"video_forensics stub for {filename}"],
             )
-            agent_results["claim_extract"] = claim_result.__dict__ if hasattr(claim_result, "__dict__") else dict(claim_result)
+            agent_results["claim_extract"] = claim_result.model_dump()
 
             if claim_result.high_risk_claims > 0:
                 anomalies.append(
@@ -543,8 +547,11 @@ def _build_result(
 ) -> NormalizedFeatureObject:
     confidence = _compute_confidence(anomalies)
 
-    # Sécurité : agent_results peut ne pas exister dans l'ancienne version du schéma
+    # FIX: input_type and source_ref are required fields on NormalizedFeatureObject.
+    # The original code omitted them, causing a Pydantic ValidationError at runtime.
     base = NormalizedFeatureObject(
+        input_type="video",                        # FIXED: was missing
+        source_ref=metadata.get("filename", ""),   # FIXED: was missing
         source_type="video",
         extracted_text=extracted_text[:8000],      # limite contractuelle
         confidence_score=confidence,

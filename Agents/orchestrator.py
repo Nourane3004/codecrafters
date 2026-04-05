@@ -137,7 +137,7 @@ async def preprocess_task(
 async def claim_extract_task(nfo: NormalizedFeatureObject) -> ClaimExtractionResult:
     log = get_run_logger()
     log.info("[agent] claim_extract starting")
-    extractor = ClaimExtractor(provider="openai_compat")   # swap to "anthropic" if needed
+    extractor = ClaimExtractor()
     text = nfo.text or ""
     result = await extractor.extract(text, source_type=nfo.input_type.value)
     log.info(f"[agent] claim_extract  total_claims={result.total_claims}  high_risk={result.high_risk_claims}")
@@ -152,7 +152,7 @@ async def claim_verify_task(
     log = get_run_logger()
     log.info("[agent] claim_verify starting")
     vs = VectorStore()
-    extractor = ClaimExtractor(provider="openai_compat")
+    extractor = ClaimExtractor()
     rag = RAGAgent(vector_store=vs, claim_extractor=extractor)
     result = await rag.run(nfo)
     log.info(
@@ -237,7 +237,7 @@ async def context_task(
 ) -> ContextAgentResult:
     log = get_run_logger()
     log.info("[agent] context starting")
-    agent = ContextAgent(use_mock=True)   # flip use_mock=False for production
+    agent = ContextAgent()
     result = await agent.run(nfo, extraction_result.claims)
     log.info(
         f"[agent] context  consistency={result.overall_consistency_score:.2f}  "

@@ -1,0 +1,425 @@
+"""
+orchestrator_api.py
+====================
+FastAPI server — port 8001
+Bridges the TruthGuard UI to the Prefect orchestrator flow.
+
+Endpoints
+---------
+GET  /health              → liveness check
+POST /analyse/plan        → compute & return agent activation plan (no agents run)
+POST /analyse             → run full pipeline, return result shaped for the UI
+
+Run
+---
+    python orchestrator_api.py
+    # or
+    uvicorn orchestrator_api:app --host 0.0.0.0 --port 8001 --reload
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from typing import Any, Optional
+
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ── Project imports ────────────────────────────────────────────────────────────
+from Agents.orchestrator import analyse_content
+from Agents.evidence_fusion import PipelineResult
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# App setup
+# ══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(
+    title="TruthGuard Orchestrator API",
+    description="Wraps the Prefect orchestrator flow for the TruthGuard UI.",
+    version="3.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _detect_input_type(filename: str) -> str:
+    """
+    Infer input_type from file extension.
+    Returns one of: image | video | document
+    """
+    ext = (filename or "").rsplit(".", 1)[-1].lower()
+    if ext in {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff"}:
+        return "image"
+    if ext in {"mp4", "mov", "avi", "webm", "mkv", "3gp"}:
+        return "video"
+    return "document"
+
+
+# ── Agent activation plan ──────────────────────────────────────────────────────
+# Mirrors the orchestrator's internal routing logic so the UI can preview
+# which agents will fire before actually running them.
+
+def _compute_plan(
+    input_type: str,
+    content_nature: str,
+    analysis_goals: list[str],
+    source_url: str,
+    post_text: str,
+) -> dict:
+    """
+    Compute which agents will be activated, with reasons.
+    Returns a flat dict of bool flags + a 'reasons' list.
+    """
+    p: dict[str, Any] = {
+        "image_forensics": False,
+        "video_forensics": False,
+        "claim_extract":   False,
+        "claim_verify":    False,
+        "source_cred":     False,
+        "context_agent":   False,
+        "network_agent":   False,
+        "linguistic":      False,
+        "reasons":         [],
+    }
+
+    def on(*agents: str, reason: str) -> None:
+        for a in agents:
+            p[a] = True
+        p["reasons"].append(reason)
+
+    # ── Input type baseline ───────────────────────────────────────────────────
+    if input_type == "image":
+        on("image_forensics", reason="File type is image → image_forensics baseline activated")
+    elif input_type == "video":
+        on("video_forensics", "linguistic",
+           reason="File type is video → video_forensics + linguistic (ASR transcription)")
+    elif input_type in ("document", "url"):
+        on("claim_extract", "claim_verify", "linguistic",
+           reason=f"File type '{input_type}' → claim pipeline + linguistic analysis")
+
+    # ── Content nature overrides ──────────────────────────────────────────────
+    NATURE_MAP: dict[str, tuple[list[str], str]] = {
+        "social_post_screenshot": (
+            ["image_forensics", "claim_extract", "claim_verify",
+             "source_cred", "context_agent", "linguistic", "network_agent"],
+            "ContentNature=social_post_screenshot → full pipeline activated",
+        ),
+        "meme": (
+            ["image_forensics", "claim_extract", "claim_verify", "context_agent", "linguistic"],
+            "ContentNature=meme → image forensics + claims + context + linguistic",
+        ),
+        "chat_screenshot": (
+            ["image_forensics", "claim_extract", "linguistic", "context_agent"],
+            "ContentNature=chat_screenshot → forensics + OCR claims + linguistic + context",
+        ),
+        "news_article": (
+            ["claim_extract", "claim_verify", "source_cred", "linguistic", "context_agent"],
+            "ContentNature=news_article → full text pipeline",
+        ),
+        "scientific_claim": (
+            ["claim_extract", "claim_verify", "context_agent"],
+            "ContentNature=scientific_claim → claim pipeline + temporal context",
+        ),
+        "government_document": (
+            ["claim_extract", "claim_verify", "source_cred", "linguistic"],
+            "ContentNature=government_document → claims + source + forgery markers",
+        ),
+        "advertisement": (
+            ["linguistic", "claim_extract", "claim_verify", "source_cred"],
+            "ContentNature=advertisement → linguistic + claim + source",
+        ),
+        "video_clip": (
+            ["video_forensics", "linguistic", "claim_extract", "context_agent"],
+            "ContentNature=video_clip → deepfake + ASR + claims + context",
+        ),
+        "url_link": (
+            ["source_cred", "claim_extract", "claim_verify", "network_agent"],
+            "ContentNature=url_link → source credibility + claim pipeline + network",
+        ),
+        "audio_clip": (
+            ["linguistic", "claim_extract"],
+            "ContentNature=audio_clip → ASR transcription + linguistic",
+        ),
+    }
+
+    if content_nature in NATURE_MAP:
+        agents, reason = NATURE_MAP[content_nature]
+        on(*agents, reason=reason)
+
+    # ── Optional enrichment ───────────────────────────────────────────────────
+    if source_url:
+        on("source_cred", "network_agent",
+           reason="Source URL provided → source_cred + network_agent")
+    if post_text and len(post_text.strip()) > 20:
+        on("claim_extract", "claim_verify",
+           reason="Explicit post text supplied → claim extraction from typed text (not OCR only)")
+
+    # ── Goal overrides ────────────────────────────────────────────────────────
+    GOAL_MAP: dict[str, tuple[list[str], str]] = {
+        "authenticity":           (["image_forensics", "linguistic"],        "Goal 'authenticity'"),
+        "deepfake_detection":     (["video_forensics", "image_forensics"],   "Goal 'deepfake_detection'"),
+        "metadata_forensics":     (["image_forensics"],                      "Goal 'metadata_forensics'"),
+        "source_credibility":     (["source_cred"],                          "Goal 'source_credibility'"),
+        "claim_verification":     (["claim_extract", "claim_verify"],        "Goal 'claim_verification'"),
+        "contextual_consistency": (["context_agent"],                        "Goal 'contextual_consistency'"),
+        "network_analysis":       (["network_agent"],                        "Goal 'network_analysis'"),
+        "linguistic_analysis":    (["linguistic"],                           "Goal 'linguistic_analysis'"),
+    }
+    for goal in analysis_goals:
+        if goal in GOAL_MAP:
+            agents, label = GOAL_MAP[goal]
+            on(*agents, reason=f"{label} → corresponding agent(s) activated")
+
+    return p
+
+
+def _pipeline_result_to_ui(result: PipelineResult, plan: dict, t_ms: int) -> dict:
+    """
+    Serialise a PipelineResult (+ plan + timing) into the JSON shape
+    the TruthGuard UI expects.
+    """
+    audit = result.audit_trail or {}
+
+    # Collect per-agent results from the audit trail's 'per_agent' block
+    per_agent_raw: dict = audit.get("per_agent", {})
+
+    # Build agent_results in the shape the UI renderAgentCards() expects
+    agent_results: dict[str, Any] = {}
+
+    # Map orchestrator agent names → UI agent keys
+    NAME_MAP = {
+        "image_forensics": "image_forensics",
+        "video_forensics": "video_forensics",
+        "claim_verify":    "claim_verify",
+        "source_cred":     "source_cred",
+        "context":         "context_agent",
+        "network":         "network_agent",
+        "linguistic":      "linguistic",
+    }
+
+    for orch_name, ui_key in NAME_MAP.items():
+        if orch_name not in per_agent_raw:
+            continue
+        sig = per_agent_raw[orch_name]  # dict with risk_score, confidence, weight, red_flags, reasoning
+        agent_results[ui_key] = {
+            "risk_score":  sig.get("risk_score", 0.5),
+            "confidence":  sig.get("confidence", 0.6),
+            "red_flags":   sig.get("red_flags", []),
+            "anomalies":   [],
+        }
+
+    # claim_extract is stored separately in audit_trail if present
+    if "claim_extraction" in audit:
+        ce = audit["claim_extraction"]
+        agent_results["claim_extract"] = {
+            "success":          True,
+            "total_claims":     ce.get("total_claims", 0),
+            "claims":           ce.get("claims", []),
+            "high_risk_claims": ce.get("high_risk_claims", 0),
+            "extraction_method": ce.get("extraction_method", "llm"),
+        }
+    if "claim_verification" in audit:
+        cv = audit["claim_verification"]
+        agent_results["claim_verify"] = {
+            **agent_results.get("claim_verify", {}),
+            "verifications":             cv.get("verifications", []),
+            "overall_support_score":     cv.get("overall_support_score", 0.5),
+            "overall_contradiction_score": cv.get("overall_contradiction_score", 0.3),
+            "verified_count":            cv.get("verified_count", 0),
+        }
+
+    # Active pipelines
+    pipelines: list[str] = []
+    if plan.get("image_forensics"):  pipelines.append("VISION")
+    if plan.get("video_forensics"):  pipelines.append("VIDEO")
+    if any(plan.get(k) for k in ("claim_extract", "claim_verify", "linguistic")):
+        pipelines.append("TEXT")
+    if any(plan.get(k) for k in ("source_cred", "network_agent")):
+        pipelines.append("URL")
+
+    agents_activated = [k for k in (
+        "image_forensics","video_forensics","claim_extract","claim_verify",
+        "source_cred","context_agent","network_agent","linguistic"
+    ) if plan.get(k)]
+
+    return {
+        # Verdict
+        "action":               result.action,
+        "label":                result.label,
+        "explanation":          result.explanation,
+        "risk_score":           result.risk_score,
+        "risk_band":            result.risk_band,
+        "confidence":           result.confidence,
+        "requires_human_review": result.requires_human_review,
+
+        # Timing
+        "processing_time_ms":  t_ms,
+
+        # Pipeline metadata
+        "active_pipelines":    pipelines,
+        "routing_notes":       plan.get("reasons", []),
+
+        # Per-agent detail cards
+        "agent_results":       agent_results,
+        "agent_plan":          plan,
+
+        # Audit trail
+        "audit_trail": {
+            "input_type":       audit.get("input_type", "unknown"),
+            "content_nature":   audit.get("content_nature", "unknown"),
+            "analysis_goals":   audit.get("analysis_goals", []),
+            "agents_activated": agents_activated,
+            **{k: v for k, v in audit.items()
+               if k not in ("per_agent", "claim_extraction", "claim_verification",
+                            "input_type", "content_nature", "analysis_goals")},
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "orchestrator_api", "version": "3.0.0"}
+
+
+@app.post("/analyse/plan")
+async def get_plan(
+    input_type:      str  = Form(...),
+    content_nature:  str  = Form(...),
+    analysis_goals:  str  = Form(...),   # JSON array string
+    source_url:      str  = Form(""),
+    post_text:       str  = Form(""),
+):
+    """
+    Compute the agent activation plan without running any agents.
+    The UI calls this at Step 4 so the user can review the plan before running.
+    """
+    try:
+        goals: list[str] = json.loads(analysis_goals)
+    except (json.JSONDecodeError, ValueError):
+        goals = []
+
+    plan = _compute_plan(
+        input_type=input_type,
+        content_nature=content_nature,
+        analysis_goals=goals,
+        source_url=source_url,
+        post_text=post_text,
+    )
+    return plan
+
+
+@app.post("/analyse")
+async def analyse(
+    input_type:      str            = Form(...),
+    content_nature:  str            = Form(...),
+    analysis_goals:  str            = Form(...),   # JSON array string
+    source_url:      str            = Form(""),
+    post_text:       str            = Form(""),
+    platform:        str            = Form(""),
+    author_handle:   str            = Form(""),
+    file:            Optional[UploadFile] = File(None),
+):
+    """
+    Run the full agent pipeline and return a UI-ready result.
+
+    The UI sends:
+      - file          (for image / video / document uploads)
+      - source_url    (for URL inputs or the original post URL)
+      - input_type    image | video | document | url
+      - content_nature  social_post_screenshot | news_article | etc.
+      - analysis_goals  JSON array of goal strings
+    """
+    try:
+        goals: list[str] = json.loads(analysis_goals)
+    except (json.JSONDecodeError, ValueError):
+        goals = []
+
+    # Build plan (needed for UI metadata even after the run)
+    plan = _compute_plan(
+        input_type=input_type,
+        content_nature=content_nature,
+        analysis_goals=goals,
+        source_url=source_url,
+        post_text=post_text,
+    )
+
+    # Read file bytes if a file was uploaded
+    file_bytes: Optional[bytes] = None
+    source_ref: str = source_url or "upload"
+
+    if file is not None:
+        file_bytes = await file.read()
+        source_ref = file.filename or "upload"
+        # If input_type was sent as "url" but a file is also present, prefer the file
+        if input_type == "url" and file_bytes:
+            input_type = _detect_input_type(source_ref)
+
+    # For URL-only submissions (no file), pass the URL as both source_ref and url param
+    url_param: Optional[str] = None
+    if input_type == "url":
+        url_param  = source_url or None
+        source_ref = source_url or "url-input"
+
+    if not file_bytes and input_type != "url":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No file uploaded for input_type='{input_type}'. "
+                "Send a file in the 'file' field, or set input_type to 'url'."
+            ),
+        )
+
+    # ── Run the Prefect orchestrator flow ──────────────────────────────────────
+    t0 = time.perf_counter()
+    try:
+        result: PipelineResult = await analyse_content(
+            source_ref=source_ref,
+            input_type=input_type,
+            file_bytes=file_bytes,
+            url=url_param,
+        )
+    except Exception as exc:
+        logger.exception("Orchestrator flow failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pipeline error: {str(exc)}",
+        ) from exc
+
+    t_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Enrich the audit trail with UI-level context that the orchestrator doesn't know about
+    if isinstance(result.audit_trail, dict):
+        result.audit_trail["input_type"]      = input_type
+        result.audit_trail["content_nature"]  = content_nature
+        result.audit_trail["analysis_goals"]  = goals
+
+    return _pipeline_result_to_ui(result, plan, t_ms)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dev runner
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    uvicorn.run("orchestrator_api:app", host="0.0.0.0", port=8001, reload=True)

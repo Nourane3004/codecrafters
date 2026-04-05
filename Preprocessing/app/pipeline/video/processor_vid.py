@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from Preprocessing.app.models.feature_object import (
+from app.models.feature_object import (
     ASRResult,
     InputType,
     NormalizedFeatureObject,

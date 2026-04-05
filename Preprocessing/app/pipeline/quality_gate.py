@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 
-from Preprocessing.app.models.feature_object import NormalizedFeatureObject, InputType
+from app.models.feature_object import NormalizedFeatureObject, InputType
 
 logger = logging.getLogger(__name__)
 

@@ -1,151 +1,227 @@
 """
-Context Agent – Agent de contexte et raisonnement temporel
------------------------------------------------------------
-Vérifie la cohérence des allégations extraites avec une base de connaissances
-(graphe de connaissances, temporalité, faits établis).
-Utilise une API comme Wikidata ou un graphe interne.
+Context Agent
+--------------
+Verifies claim consistency against world knowledge and temporal logic.
+LLM backend: Groq  (llama-3.3-70b-versatile)
+Fallback:    Wikidata entity search (no LLM required)
+
+The mock has been removed entirely.
 """
 
 import asyncio
+import json
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+import os
+import re
 from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
 import httpx
 
+from claim_extractor import ExtractedClaim
+
 logger = logging.getLogger(__name__)
 
-# On réutilise les structures de claim_extractor
-from claim_extractor import ExtractedClaim
+# ── Groq client ────────────────────────────────────────────────────────────────
+try:
+    from groq import Groq
+    _groq_available = True
+except ImportError:
+    _groq_available = False
+    logger.warning("groq package not installed — context agent will use Wikidata-only fallback")
+
+_GROQ_MODEL = "llama-3.3-70b-versatile"
+
+_CONTEXT_SYSTEM = """You are a world-knowledge consistency checker for a misinformation detection system.
+
+Given a factual claim, evaluate whether it is consistent with established world knowledge.
+
+Respond ONLY with a valid JSON object — no markdown, no preamble:
+{
+  "is_consistent": true|false,
+  "confidence": 0.0-1.0,
+  "supporting_facts": ["<fact1>", "<fact2>"],
+  "contradicting_facts": ["<fact1>"],
+  "temporal_issues": ["<issue1>"]
+}
+
+Rules:
+- is_consistent: true if the claim aligns with well-established facts
+- confidence: how certain you are (0 = no idea, 1 = certain)
+- supporting_facts: specific facts from your knowledge that support the claim
+- contradicting_facts: specific facts that contradict it
+- temporal_issues: any date/timing inconsistencies (e.g. "event predates the entity's existence")
+- Be concise. Max 2 items per list.
+- If you have no knowledge about the claim, set confidence to 0.3 and is_consistent to false.
+"""
 
 
 # =============================================================================
-# Modèles de sortie
+# Output models
 # =============================================================================
 
 @dataclass
 class ContextCheck:
-    """Vérification individuelle pour une allégation."""
     claim_text: str
     claim_id: int
-    is_consistent: bool           # True si cohérent avec la base de connaissances
-    confidence: float             # 0-1
-    supporting_facts: List[str]   # extraits de la base de connaissances
+    is_consistent: bool
+    confidence: float
+    supporting_facts: List[str]
     contradicting_facts: List[str]
-    temporal_issues: List[str]    # par ex. "La date de l'événement est antérieure à la création de l'entité"
+    temporal_issues: List[str]
     agent_errors: List[str]
+
 
 @dataclass
 class ContextAgentResult:
-    """Résultat global de l'agent de contexte."""
     source_ref: str
     input_type: str
-    overall_consistency_score: float          # moyenne des is_consistent pondérée
-    temporal_coherence_score: float           # score dédié à la temporalité
+    overall_consistency_score: float
+    temporal_coherence_score: float
     checks: List[ContextCheck] = field(default_factory=list)
     agent_errors: List[str] = field(default_factory=list)
 
 
 # =============================================================================
-# Agent principal
+# Agent
 # =============================================================================
 
 class ContextAgent:
-    """
-    Agent de contexte utilisant un graphe de connaissances (ex. Wikidata)
-    et un raisonnement temporel pour évaluer la plausibilité des allégations.
-    """
-
-    def __init__(
-        self,
-        wikidata_api_url: str = "https://www.wikidata.org/wiki/Special:EntityData",
-        use_mock: bool = True,                # Pour développement sans API externe
-        timeout: float = 10.0,
-    ):
-        self.wikidata_api_url = wikidata_api_url
-        self.use_mock = use_mock
+    def __init__(self, timeout: float = 15.0):
         self.timeout = timeout
 
-    async def run(self, nfo: Any, claims: List[ExtractedClaim]) -> ContextAgentResult:
-        """
-        Exécute l'agent de contexte.
-        Nécessite les allégations extraites (peut être appelé après ClaimExtractor).
-        """
-        errors = []
-        checks = []
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        if _groq_available and api_key:
+            self._groq = Groq(api_key=api_key)
+            self._llm_ready = True
+        else:
+            self._groq = None
+            self._llm_ready = False
+            if not _groq_available:
+                logger.warning("groq package missing — context agent will use Wikidata fallback")
+            else:
+                logger.warning("GROQ_API_KEY not set — context agent will use Wikidata fallback")
 
+    async def run(self, nfo: Any, claims: List[ExtractedClaim]) -> ContextAgentResult:
         if not claims:
             return ContextAgentResult(
                 source_ref=nfo.source_ref,
-                input_type=nfo.input_type,
+                input_type=str(nfo.input_type),
                 overall_consistency_score=0.5,
                 temporal_coherence_score=0.5,
                 agent_errors=["No claims to check"],
             )
 
-        for claim in claims:
-            check = await self._check_single_claim(claim)
-            checks.append(check)
+        checks = await asyncio.gather(
+            *[self._check_single_claim(claim) for claim in claims],
+            return_exceptions=False,
+        )
 
-        # Scores globaux
-        total_confidence = sum(c.confidence for c in checks)
-        if total_confidence == 0:
+        # Overall consistency (confidence-weighted)
+        total_conf = sum(c.confidence for c in checks)
+        if total_conf == 0:
             overall_consistency = 0.5
         else:
             overall_consistency = sum(
-                (1.0 if c.is_consistent else 0.0) * c.confidence
-                for c in checks
-            ) / total_confidence
+                (1.0 if c.is_consistent else 0.0) * c.confidence for c in checks
+            ) / total_conf
 
-        # Score temporel : moyenne des absence de temporal_issues
-        temporal_scores = []
-        for c in checks:
-            if not c.temporal_issues:
-                temporal_scores.append(1.0)
-            else:
-                temporal_scores.append(0.0)
-        temporal_coherence = sum(temporal_scores) / len(temporal_scores) if temporal_scores else 0.5
+        # Temporal coherence: fraction of claims with no temporal issues
+        temporal_scores = [0.0 if c.temporal_issues else 1.0 for c in checks]
+        temporal_coherence = sum(temporal_scores) / len(temporal_scores)
 
         return ContextAgentResult(
             source_ref=nfo.source_ref,
-            input_type=nfo.input_type,
+            input_type=str(nfo.input_type),
             overall_consistency_score=overall_consistency,
             temporal_coherence_score=temporal_coherence,
-            checks=checks,
-            agent_errors=errors,
+            checks=list(checks),
         )
 
     async def _check_single_claim(self, claim: ExtractedClaim) -> ContextCheck:
-        """Vérifie une allégation unique via la base de connaissances."""
-        if self.use_mock:
-            return await self._mock_check(claim)
+        if self._llm_ready:
+            try:
+                return await asyncio.to_thread(self._groq_check, claim)
+            except Exception as exc:
+                logger.warning(f"Groq context check failed for claim {claim.claim_id}: {exc} — trying Wikidata")
 
-        # Version réelle avec Wikidata
+        # Fallback: Wikidata entity search
         return await self._wikidata_check(claim)
 
-    async def _mock_check(self, claim: ExtractedClaim) -> ContextCheck:
-        """Simulation pour test – à remplacer."""
-        await asyncio.sleep(0.02)
-        # Logique simpliste : si l'allégation contient "fusion energy" ou "ITER", on la considère cohérente
-        text_lower = claim.claim_text.lower()
-        if "fusion" in text_lower or "iter" in text_lower:
+    # ── Groq-powered check ─────────────────────────────────────────────────────
+
+    def _groq_check(self, claim: ExtractedClaim) -> ContextCheck:
+        response = self._groq.chat.completions.create(
+            model=_GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": _CONTEXT_SYSTEM},
+                {"role": "user", "content": f"Claim: {claim.claim_text}"},
+            ],
+            temperature=0.0,
+            max_tokens=512,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?", "", raw, flags=re.MULTILINE).strip()
+        raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+
+        return ContextCheck(
+            claim_text=claim.claim_text,
+            claim_id=claim.claim_id,
+            is_consistent=bool(data.get("is_consistent", False)),
+            confidence=float(data.get("confidence", 0.5)),
+            supporting_facts=data.get("supporting_facts", []),
+            contradicting_facts=data.get("contradicting_facts", []),
+            temporal_issues=data.get("temporal_issues", []),
+            agent_errors=[],
+        )
+
+    # ── Wikidata fallback ──────────────────────────────────────────────────────
+
+    async def _wikidata_check(self, claim: ExtractedClaim) -> ContextCheck:
+        """
+        Searches Wikidata for named entities in the claim.
+        If at least one entity is found, marks the claim as partially consistent.
+        No LLM required.
+        """
+        entities = claim.entities or re.findall(
+            r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b", claim.claim_text
+        )
+        found_entities: List[str] = []
+        errors: List[str] = []
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            for ent in entities[:3]:
+                try:
+                    resp = await client.get(
+                        "https://www.wikidata.org/w/api.php",
+                        params={
+                            "action": "wbsearchentities",
+                            "search": ent,
+                            "language": "en",
+                            "format": "json",
+                            "limit": 1,
+                        },
+                    )
+                    data = resp.json()
+                    if data.get("search"):
+                        label = data["search"][0].get("label", ent)
+                        desc  = data["search"][0].get("description", "")
+                        found_entities.append(f"{label}: {desc}" if desc else label)
+                except Exception as exc:
+                    errors.append(f"Wikidata lookup failed for '{ent}': {exc}")
+
+        if found_entities:
             is_consistent = True
-            confidence = 0.85
-            supporting = ["ITER est un projet de recherche sur la fusion nucléaire (source: Wikidata Q165467)."]
-            contradicting = []
-            temporal_issues = []
-        elif "coal power plants will be fully phased out by 2025" in text_lower:
-            is_consistent = False
-            confidence = 0.7
-            supporting = []
-            contradicting = ["Selon l'AIE, le charbon fournit encore 36% de l'électricité mondiale en 2024, un abandon total avant 2030 est peu probable."]
-            temporal_issues = ["L'échéance 2025 est trop proche pour une transition complète."]
+            confidence    = 0.55          # moderate — we found entities but didn't verify the claim
+            supporting    = [f"Entity found in Wikidata: {e}" for e in found_entities]
+            contradicting: List[str] = []
         else:
             is_consistent = False
-            confidence = 0.5
-            supporting = []
-            contradicting = ["Aucune information trouvée dans la base de connaissances."]
-            temporal_issues = []
+            confidence    = 0.3
+            supporting    = []
+            contradicting = ["No named entities from this claim found in Wikidata."]
+
         return ContextCheck(
             claim_text=claim.claim_text,
             claim_id=claim.claim_id,
@@ -153,42 +229,6 @@ class ContextAgent:
             confidence=confidence,
             supporting_facts=supporting,
             contradicting_facts=contradicting,
-            temporal_issues=temporal_issues,
-            agent_errors=[],
+            temporal_issues=[],
+            agent_errors=errors,
         )
-
-    async def _wikidata_check(self, claim: ExtractedClaim) -> ContextCheck:
-        """
-        Version réelle utilisant l'API Wikidata pour rechercher des entités et
-        vérifier les faits. Implémentation simplifiée – à compléter.
-        """
-        # 1. Extraire les entités nommées (déjà dans claim.entities)
-        entities = claim.entities
-        if not entities:
-            # Sinon, tenter d'extraire des noms propres du texte
-            import re
-            entities = re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', claim.claim_text)
-
-        # 2. Requête SPARQL simplifiée via l'API de Wikidata
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            # Exemple : rechercher l'identifiant d'une entité
-            for ent in entities[:2]:  # limite
-                url = f"https://www.wikidata.org/w/api.php"
-                params = {
-                    "action": "wbsearchentities",
-                    "search": ent,
-                    "language": "en",
-                    "format": "json",
-                }
-                resp = await client.get(url, params=params)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("search"):
-                        # Premier résultat
-                        entity_id = data["search"][0]["id"]
-                        # On pourrait ensuite récupérer les déclarations (claims) de l'entité
-                        # pour comparer avec l'allégation.
-                        pass
-
-        # Pour l'instant, on retourne un mock (à remplacer par vraie logique)
-        return await self._mock_check(claim)
