@@ -6,20 +6,19 @@ Claim Extractor Agent – Version améliorée
 - Retourne une structure riche (ExtractedClaim) + une liste simple pour compatibilité
 - Intègre la logique de sélection de texte selon le type d'entrée (image, URL, document, vidéo)
 - Asynchrone, avec fallback heuristique
+- **NOUVEAU** : lecture directe de PDF (texte + OCR optionnel sur les images)
 """
 
 import asyncio
 import json
 import logging
 import re
-from typing import Optional, Literal, List, Union, Any
+from typing import Optional, Literal, List, Union, Any, Tuple
 from dataclasses import dataclass, field
 import httpx
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
-
-
 
 # =============================================================================
 # Modèles de sortie (compatibles avec le verifier)
@@ -46,6 +45,115 @@ class ClaimExtractionResult(BaseModel):
     extraction_method: Literal["llm", "heuristic", "failed"] = "failed"
     reasoning_notes: List[str] = Field(default_factory=list)
     error: Optional[str] = None
+
+# =============================================================================
+# Extraction de texte à partir de fichiers (PDF, images, etc.)
+# =============================================================================
+
+def extract_text_from_pdf(file_bytes: bytes, ocr_images: bool = False) -> Tuple[str, List[str]]:
+    """
+    Extrait le texte d'un PDF.
+    Retourne (texte_complet, liste_des_textes_extraits_des_images)
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.error("PyMuPDF (fitz) not installed. Run: pip install pymupdf")
+        return "", []
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    full_text = []
+    image_texts = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        # Texte classique
+        page_text = page.get_text()
+        if page_text.strip():
+            full_text.append(page_text)
+
+        # OCR sur les images de la page (optionnel)
+        if ocr_images:
+            try:
+                import pytesseract
+                from PIL import Image
+                import io
+            except ImportError:
+                logger.warning("OCR (pytesseract/PIL) not installed. Skipping image OCR.")
+                ocr_images = False  # désactiver pour la suite
+
+            if ocr_images:
+                image_list = page.get_images(full=True)
+                for img_index, img in enumerate(image_list):
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    pil_image = Image.open(io.BytesIO(image_bytes))
+                    # OCR
+                    try:
+                        ocr_text = pytesseract.image_to_string(pil_image, lang="eng+fra")
+                        if ocr_text.strip():
+                            image_texts.append(ocr_text.strip())
+                    except Exception as e:
+                        logger.warning(f"OCR failed on image {img_index} page {page_num}: {e}")
+    doc.close()
+
+    combined_text = "\n".join(full_text)
+    if image_texts:
+        combined_text += "\n\n--- Texte extrait des images (OCR) ---\n" + "\n".join(image_texts)
+    return combined_text, image_texts
+
+def extract_text_from_image(file_bytes: bytes) -> str:
+    """Extrait le texte d'une image via OCR (tesseract requis)."""
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(file_bytes))
+        text = pytesseract.image_to_string(img, lang="eng+fra")
+        return text.strip()
+    except ImportError:
+        logger.error("OCR (pytesseract/PIL) not installed. Cannot extract text from image.")
+        return ""
+    except Exception as e:
+        logger.error(f"Image OCR failed: {e}")
+        return ""
+
+def extract_text_from_file(file_bytes: bytes, filename: str, ocr_images_in_pdf: bool = False) -> str:
+    """
+    Point d'entrée unique pour extraire le texte d'un fichier.
+    Supporte .pdf, .txt, .md, .csv, .docx (basique), et images (OCR).
+    """
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    if ext == "pdf":
+        text, _ = extract_text_from_pdf(file_bytes, ocr_images=ocr_images_in_pdf)
+        return text
+    elif ext in ("txt", "md", "csv"):
+        try:
+            return file_bytes.decode("utf-8", errors="ignore").strip()
+        except:
+            return ""
+    elif ext == "docx":
+        try:
+            import zipfile, io
+            zf = zipfile.ZipFile(io.BytesIO(file_bytes))
+            xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+            # Nettoyage basique
+            text = re.sub(r"<[^>]+>", " ", xml)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text
+        except Exception as e:
+            logger.warning(f"DOCX extraction failed: {e}")
+            return ""
+    elif ext in ("jpg", "jpeg", "png", "gif", "bmp", "tiff"):
+        return extract_text_from_image(file_bytes)
+    else:
+        # Tentative de décodage en texte brut
+        try:
+            return file_bytes.decode("utf-8", errors="ignore").strip()
+        except:
+            return ""
 
 # =============================================================================
 # Sélecteur de texte selon le type d'entrée (copié depuis l'ancien ClaimExtractor)
@@ -147,6 +255,7 @@ class ClaimExtractor:
     - Anthropic (Claude)
     - OpenAI compatible (Ollama, vLLM, etc.)
     - Fallback heuristique
+    - Lecture directe de fichiers (PDF, images, DOCX, TXT)
     """
 
     def __init__(
@@ -157,12 +266,14 @@ class ClaimExtractor:
         api_base: str = "http://localhost:11434/v1", # pour openai_compat
         api_key: Optional[str] = None,               # pour anthropic
         timeout: float = 60.0,
+        ocr_images_in_pdf: bool = False,            # Active l'OCR sur les images des PDF
     ):
         self.provider = provider
         self.model = model
         self.anthropic_model = anthropic_model
         self.api_base = api_base.rstrip("/")
         self.timeout = timeout
+        self.ocr_images_in_pdf = ocr_images_in_pdf
 
         if provider == "anthropic":
             try:
@@ -175,8 +286,22 @@ class ClaimExtractor:
         else:
             self._available = True  # on suppose httpx fonctionne
 
+    async def extract_from_file(self, file_bytes: bytes, filename: str, source_type: str = "document") -> ClaimExtractionResult:
+        """
+        Extrait le texte du fichier puis analyse les allégations.
+        """
+        text = extract_text_from_file(file_bytes, filename, ocr_images_in_pdf=self.ocr_images_in_pdf)
+        if not text:
+            return ClaimExtractionResult(
+                success=False,
+                extraction_method="failed",
+                error="No text could be extracted from the file",
+                reasoning_notes=["File empty or unsupported format"]
+            )
+        return await self.extract(text, source_type)
+
     async def extract(self, text: str, source_type: str = "unknown") -> ClaimExtractionResult:
-        """Point d'entrée principal."""
+        """Point d'entrée principal (texte déjà extrait)."""
         if not text or not text.strip():
             return ClaimExtractionResult(
                 success=False,
@@ -202,7 +327,6 @@ class ClaimExtractor:
 
     async def _extract_with_anthropic(self, text: str, source_type: str) -> ClaimExtractionResult:
         try:
-            # Troncature
             user_content = text[:12000] if len(text) > 12000 else text
             response = self._anthropic_client.messages.create(
                 model=self.anthropic_model,
@@ -239,7 +363,6 @@ class ClaimExtractor:
             )
 
     def _parse_llm_response(self, raw_json: str, method: str) -> ClaimExtractionResult:
-        # Nettoyage des markdown
         raw_json = re.sub(r'^```(?:json)?', '', raw_json, flags=re.MULTILINE).strip()
         raw_json = re.sub(r'```$', '', raw_json, flags=re.MULTILINE).strip()
         data = json.loads(raw_json)
@@ -303,7 +426,6 @@ class ClaimExtractor:
             type_counts[c.claim_type] = type_counts.get(c.claim_type, 0) + 1
         dominant = sorted(type_counts, key=type_counts.get, reverse=True)[:3]
 
-        # Score de confiance pour le quality gate
         base = 0.5 if parsed else 0.0
         high_bonus = min(0.3, sum(0.1 for c in parsed if c.verifiability == "HIGH"))
         risk_penalty = min(0.3, high_risk * 0.05)
