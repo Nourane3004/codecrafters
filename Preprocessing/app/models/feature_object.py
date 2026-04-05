@@ -176,3 +176,15 @@ class NormalizedFeatureObject(BaseModel):
 
     # ── Pipeline errors ──
     errors:         list[str]      = Field(default_factory=list)
+
+    # ── Per-agent outputs (populated by individual agents) ──
+    agent_results:  Optional[dict] = None
+
+    # ── Image forensics fields (populated by ImageForensicsAgent) ──
+    source_type:        Optional[str]       = None   # e.g. "image"
+    confidence_score:   float               = 0.0    # 0-1
+    raw_bytes_hash:     str                 = ""     # SHA-256 hex of raw file bytes
+    anomalies_detected: list[str]           = Field(default_factory=list)
+    reasoning_notes:    list[str]           = Field(default_factory=list)
+    extracted_text:     str                 = ""     # OCR / text surface for agents
+    metadata:           Optional[dict]      = None   # image dimensions, EXIF, etc.

@@ -64,7 +64,7 @@ from Agents.agent_image_forensics import process as image_forensics_process
 from Agents.agent_video_forensics import process as video_forensics_process
 
 # Evidence fusion + decision engine
-from Agents.evidence_fusion import (
+from evidence_fusion import (
     fuse_evidence,
     FusionResult,
     DecisionEngine,

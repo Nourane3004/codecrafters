@@ -495,19 +495,19 @@ def _build_result(
     confidence = _compute_confidence(anomalies)
 
     obj = NormalizedFeatureObject(
+        input_type="image",
+        source_ref=metadata.get("filename", ""),
+        # image-forensics specific fields
         source_type="image",
-        extracted_text=extracted_text[:MAX_TEXT_STORE],
         confidence_score=confidence,
-        anomalies_detected=anomalies,
-        metadata=metadata,
-        reasoning_notes=reasoning,
         raw_bytes_hash=raw_hash,
+        anomalies_detected=anomalies,
+        reasoning_notes=reasoning,
+        extracted_text=extracted_text[:MAX_TEXT_STORE],
+        metadata=metadata,
+        text=extracted_text[:MAX_TEXT_STORE],
+        errors=[a for a in anomalies if "error" in a.lower()],
+        agent_results=agent_results or {},
     )
-
-    # Ajout défensif — agent_results peut ne pas encore exister dans le schéma
-    try:
-        obj.agent_results = agent_results
-    except AttributeError:
-        pass
 
     return obj
