@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 from typing import Union
 
-from app.models.feature_object import (
+from Preprocessing.app.models.feature_object import (
     DocMetadata,
     DocumentData,
     InputType,

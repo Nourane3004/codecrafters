@@ -347,7 +347,7 @@ def test_image_forensics():
 
 async def test_evidence_fusion():
     header("TEST 7 — EvidenceFusion layer")
-    from evidence_fusion import fuse_evidence, FusionResult, DecisionEngine, PipelineResult
+    from Agents.evidence_fusion import fuse_evidence, FusionResult, DecisionEngine, PipelineResult
     from Agents.claim_verifier   import ClaimVerifyResult
     from Agents.context_agent    import ContextAgent
     from Agents.source_cred_agent import SourceCredibilityAgent
@@ -407,7 +407,7 @@ async def test_evidence_fusion():
 
 async def test_fusion_edge_cases():
     header("TEST 8 — Fusion edge cases")
-    from evidence_fusion import fuse_evidence, DecisionEngine
+    from Agents.evidence_fusion import fuse_evidence, DecisionEngine
     from Agents.claim_verifier    import ClaimVerifyResult
     from Agents.source_cred_agent import SourceCredibilityAgent, SourceCredibilityResult
     from Agents.context_agent     import ContextAgent

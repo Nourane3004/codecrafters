@@ -64,7 +64,7 @@ from Agents.agent_image_forensics import process as image_forensics_process
 from Agents.agent_video_forensics import process as video_forensics_process
 
 # Evidence fusion + decision engine
-from evidence_fusion import (
+from Agents.evidence_fusion import (
     fuse_evidence,
     FusionResult,
     DecisionEngine,
@@ -383,12 +383,13 @@ async def analyse_content(
     t_start = time.perf_counter()
 
     # ── 1. Preprocessing ──────────────────────────────────────────────────────
-    nfo = await preprocess_task(
+    # In Prefect v3, use .submit().result() — never await .result()
+    nfo = preprocess_task.submit(
         file_bytes=file_bytes,
         source_ref=source_ref,
         input_type=input_type,
         url=url,
-    )
+    ).result()
 
     if not nfo.quality_passed:
         log.warning(f"Quality gate rejected input: {nfo.quality_reason}")
@@ -405,11 +406,12 @@ async def analyse_content(
         )
 
     # ── 2. Claim extraction first (others may depend on claims list) ──────────
+    # In Prefect v3, .result() is synchronous — never await it.
     extraction_future = claim_extract_task.submit(nfo)
-    extraction: ClaimExtractionResult = await extraction_future.result()
+    extraction: ClaimExtractionResult = extraction_future.result()
 
     # ── 3. Parallel agent committee ───────────────────────────────────────────
-    # Tasks that depend only on NFO
+    # Submit all tasks — Prefect's ConcurrentTaskRunner runs them in parallel.
     source_future  = source_cred_task.submit(nfo)
     network_future = network_task.submit(nfo)
     ling_future    = linguistic_task.submit(nfo)
@@ -420,24 +422,14 @@ async def analyse_content(
     verify_future  = claim_verify_task.submit(nfo, extraction)
     context_future = context_task.submit(nfo, extraction)
 
-    # Gather all
-    (
-        source_cred,
-        network,
-        linguistic,
-        image_forensics,
-        video_forensics,
-        claim_verify,
-        context,
-    ) = await asyncio.gather(
-        source_future.result(),
-        network_future.result(),
-        ling_future.result(),
-        img_future.result(),
-        vid_future.result(),
-        verify_future.result(),
-        context_future.result(),
-    )
+    # Resolve all futures synchronously (Prefect v3 — .result() blocks until done)
+    source_cred     = source_future.result()
+    network         = network_future.result()
+    linguistic      = ling_future.result()
+    image_forensics = img_future.result()
+    video_forensics = vid_future.result()
+    claim_verify    = verify_future.result()
+    context         = context_future.result()
 
     # ── 4. Evidence fusion ────────────────────────────────────────────────────
     fusion = fuse_evidence_task(
