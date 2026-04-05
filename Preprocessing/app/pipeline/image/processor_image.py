@@ -20,7 +20,7 @@ import numpy as np
 import pytesseract
 from PIL import Image as PILImage
 
-from app.models.feature_object import (
+from models.feature_object import (
     EXIFData,
     ImageMetadata,
     InputType,
