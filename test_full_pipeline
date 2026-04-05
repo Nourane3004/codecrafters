@@ -1,0 +1,612 @@
+"""
+test_full_pipeline.py
+=====================
+Full end-to-end test suite for TruthGuard / MENACRAFT.
+Covers:
+  1. Individual agents (unit tests)
+  2. Evidence fusion layer
+  3. Full Prefect orchestrator flow (integration test)
+
+Run from the project root:
+    python test_full_pipeline.py
+
+Dependencies probed at runtime — missing ones cause that test to SKIP,
+not FAIL. Only assertion errors and unexpected exceptions count as FAIL.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import sys
+import os
+import traceback
+import textwrap
+from typing import Optional
+from unittest.mock import patch, MagicMock
+
+# ── ensure project root is on sys.path ────────────────────────────
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+# ── ANSI colours ──────────────────────────────────────────────────
+GREEN  = "\033[92m"; YELLOW = "\033[93m"; RED = "\033[91m"
+CYAN   = "\033[96m"; BOLD   = "\033[1m";  RESET = "\033[0m"
+PASS = f"{GREEN}PASS{RESET}"; SKIP = f"{YELLOW}SKIP{RESET}"; FAIL = f"{RED}FAIL{RESET}"
+
+_results: dict[str, str] = {}
+
+
+# ══════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════
+
+def header(title: str) -> None:
+    print(f"\n{BOLD}{CYAN}{'='*60}{RESET}")
+    print(f"{BOLD}{CYAN}  {title}{RESET}")
+    print(f"{BOLD}{CYAN}{'='*60}{RESET}")
+
+def row(label: str, value) -> None:
+    print(f"  {label:<26}: {value}")
+
+def ok(label: str, value) -> None:
+    row(label, value)
+
+def check(label: str, value, condition: bool) -> None:
+    row(label, value)
+    if not condition:
+        raise AssertionError(f"{label} failed — got: {value!r}")
+
+def _run(name: str, fn) -> None:
+    try:
+        fn()
+    except Exception:
+        _results[name] = "FAIL"
+        print(f"\n  {FAIL} — {name}:")
+        traceback.print_exc()
+
+async def _run_async(name: str, fn) -> None:
+    try:
+        await fn()
+    except Exception:
+        _results[name] = "FAIL"
+        print(f"\n  {FAIL} — {name}:")
+        traceback.print_exc()
+
+
+# ══════════════════════════════════════════════════════════════════
+# Fixtures — shared synthetic inputs
+# ══════════════════════════════════════════════════════════════════
+
+def _make_jpeg_bytes(w: int = 300, h: int = 300, color=(180, 100, 80)) -> bytes:
+    from PIL import Image
+    img = Image.new("RGB", (w, h), color=color)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+SAMPLE_TEXT = textwrap.dedent("""\
+    Breaking: Scientists at ITER announced that fusion energy will power all homes
+    by 2025. The government doesn't want you to know this secret. Share before deleted!
+    100% of experts agree this is a revolutionary breakthrough. Coal power plants
+    will be fully phased out by 2025 according to anonymous sources.
+""")
+
+SAMPLE_DOC_BYTES = SAMPLE_TEXT.encode("utf-8")
+
+
+def _make_nfo(input_type: str = "document"):
+    """Return a minimal NormalizedFeatureObject for agent testing."""
+    from Preprocessing.app.models.feature_object import (
+        NormalizedFeatureObject, InputType,
+        DocumentData, TextExtract, LayoutInfo, DocMetadata,
+        PageScrape, MetaExtract, DomainInfo,
+    )
+    from datetime import datetime
+
+    it = InputType(input_type)
+
+    common = dict(
+        input_type=it,
+        source_ref="test_source",
+        text=SAMPLE_TEXT,
+        language="en",
+        quality_passed=True,
+        quality_reason="smoke_test",
+        dedup_hash="a" * 64,
+        processed_at=datetime.utcnow().isoformat(),
+    )
+
+    if it == InputType.DOCUMENT:
+        doc_data = DocumentData(
+            text_extract=TextExtract(raw_text=SAMPLE_TEXT, extraction_method="plain"),
+            layout=LayoutInfo(word_count=len(SAMPLE_TEXT.split())),
+            doc_meta=DocMetadata(),
+        )
+        return NormalizedFeatureObject(**common, document_data=doc_data)
+
+    if it == InputType.URL:
+        url_data = PageScrape(
+            status_code=200,
+            final_url="https://example-news.xyz/story",
+            raw_text=SAMPLE_TEXT,
+            meta=MetaExtract(title="Breaking Fusion Energy News"),
+            domain_info=DomainInfo(domain="example-news.xyz", age_days=15, is_new_domain=True),
+        )
+        return NormalizedFeatureObject(**common, url_data=url_data)
+
+    if it == InputType.IMAGE:
+        from Preprocessing.app.models.feature_object import ImageMetadata, OCRResult, EXIFData
+        img_meta = ImageMetadata(
+            width=300, height=300, format="JPEG",
+            ocr=OCRResult(raw_text=SAMPLE_TEXT, confidence=0.88),
+            exif=EXIFData(exif_stripped=True),
+        )
+        return NormalizedFeatureObject(**common, image_meta=img_meta)
+
+    return NormalizedFeatureObject(**common)
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 1 — Claim Extractor Agent
+# ══════════════════════════════════════════════════════════════════
+
+async def test_claim_extractor():
+    header("TEST 1 — ClaimExtractor agent")
+    from Agents.claim_extractor import ClaimExtractor, ClaimExtractionResult
+
+    extractor = ClaimExtractor(provider="openai_compat")
+
+    # Test with heuristic fallback (no LLM server needed)
+    result: ClaimExtractionResult = await extractor.extract(SAMPLE_TEXT, source_type="document")
+
+    check("success",         result.success,         result.success is True)
+    check("total_claims",    result.total_claims,     result.total_claims > 0)
+    check("extraction_method", result.extraction_method, result.extraction_method in ("llm","heuristic"))
+    ok("high_risk_claims",   result.high_risk_claims)
+    ok("dominant_types",     result.dominant_claim_types)
+    ok("reasoning_notes",    result.reasoning_notes)
+    check("confidence",      result.confidence_contribution,
+          0.0 <= result.confidence_contribution <= 1.0)
+
+    # Empty text → graceful failure
+    empty_result = await extractor.extract("", source_type="document")
+    check("empty_text_handled", empty_result.success, empty_result.success is False)
+
+    print(f"\n  {PASS} — ClaimExtractor OK")
+    _results["ClaimExtractor"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 2 — Context Agent
+# ══════════════════════════════════════════════════════════════════
+
+async def test_context_agent():
+    header("TEST 2 — ContextAgent")
+    from Agents.context_agent import ContextAgent
+    from Agents.claim_extractor import ClaimExtractor
+
+    nfo = _make_nfo("document")
+    extractor = ClaimExtractor(provider="openai_compat")
+    extraction = await extractor.extract(SAMPLE_TEXT, source_type="document")
+
+    agent = ContextAgent(use_mock=True)
+    result = await agent.run(nfo, extraction.claims)
+
+    check("source_ref",          result.source_ref, result.source_ref == "test_source")
+    check("consistency_score",   result.overall_consistency_score,
+          0.0 <= result.overall_consistency_score <= 1.0)
+    check("temporal_coherence",  result.temporal_coherence_score,
+          0.0 <= result.temporal_coherence_score <= 1.0)
+    ok("checks_count",           len(result.checks))
+
+    # No claims → graceful handling
+    empty_result = await agent.run(nfo, [])
+    check("no_claims_handled",   empty_result.overall_consistency_score,
+          0.0 <= empty_result.overall_consistency_score <= 1.0)
+
+    print(f"\n  {PASS} — ContextAgent OK")
+    _results["ContextAgent"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 3 — Source Credibility Agent
+# ══════════════════════════════════════════════════════════════════
+
+async def test_source_cred_agent():
+    header("TEST 3 — SourceCredibilityAgent")
+    from Agents.source_cred_agent import SourceCredibilityAgent
+
+    # URL input with a suspicious domain
+    nfo = _make_nfo("url")
+    agent = SourceCredibilityAgent()
+    result = await agent.run(nfo)
+
+    check("source_ref",    result.source_ref, result.source_ref == "test_source")
+    check("overall_score", result.overall_score, 0.0 <= result.overall_score <= 1.0)
+    ok("domain",           result.domain)
+    ok("red_flags",        result.red_flags)
+    ok("evidence",         result.evidence)
+
+    # Image input (no domain) → returns a default low-trust result
+    nfo_img = _make_nfo("image")
+    result_img = await agent.run(nfo_img)
+    check("no_domain_score", result_img.overall_score, 0.0 <= result_img.overall_score <= 1.0)
+
+    print(f"\n  {PASS} — SourceCredibilityAgent OK")
+    _results["SourceCredibility"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 4 — Network Agent
+# ══════════════════════════════════════════════════════════════════
+
+def test_network_agent():
+    header("TEST 4 — NetworkAgent")
+    from Agents.network_agent import analyse_network
+
+    # Suspicious URL with known shortener
+    result = analyse_network(
+        source_type="url",
+        url="http://bit.ly/secret-info",
+        extracted_text=SAMPLE_TEXT + " Share before they delete this! Forward to 10 friends.",
+    )
+
+    check("success",         result.success,         result.success is True)
+    check("bot_probability", result.bot_probability, 0.0 <= result.bot_probability <= 1.0)
+    check("risk_level",      result.network_risk_level,
+          result.network_risk_level in ("LOW","MEDIUM","HIGH","CRITICAL"))
+    check("propagation",     result.propagation_pattern,
+          result.propagation_pattern in ("ORGANIC","COORDINATED","AUTOMATED","UNKNOWN"))
+    ok("red_flags",          result.red_flags)
+    ok("confidence_contrib", result.confidence_contribution)
+
+    # Clean input → should be LOW risk
+    clean = analyse_network(
+        source_type="url",
+        url="https://reuters.com/article/politics/government-budget-2025",
+        extracted_text="The government released its annual budget report today.",
+    )
+    ok("clean_bot_prob", clean.bot_probability)
+
+    print(f"\n  {PASS} — NetworkAgent OK")
+    _results["NetworkAgent"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 5 — Linguistic Agent
+# ══════════════════════════════════════════════════════════════════
+
+def test_linguistic_agent():
+    header("TEST 5 — LinguisticAgent")
+    from Agents.linguistic_agent import analyse_linguistics
+
+    result = analyse_linguistics(
+        extracted_text=SAMPLE_TEXT,
+        title="BREAKING: Scientists EXPOSE Secret Fusion Energy You Won't Believe!",
+        source_type="url",
+    )
+
+    check("success",          result.success,          result.success is True)
+    check("clickbait_score",  result.clickbait_score,  0.0 <= result.clickbait_score <= 1.0)
+    check("ai_gen_score",     result.ai_generated_score, 0.0 <= result.ai_generated_score <= 1.0)
+    check("risk_level",       result.linguistic_risk_level,
+          result.linguistic_risk_level in ("LOW","MEDIUM","HIGH","CRITICAL","UNKNOWN"))
+    ok("dominant_signals",    result.dominant_signals)
+    ok("red_flags",           result.red_flags)
+    ok("confidence_contrib",  result.confidence_contribution)
+
+    # Empty input → graceful
+    empty = analyse_linguistics(extracted_text="", title="", source_type="text")
+    check("empty_success", empty.success, empty.success is True)
+
+    print(f"\n  {PASS} — LinguisticAgent OK")
+    _results["LinguisticAgent"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 6 — Image Forensics Agent
+# ══════════════════════════════════════════════════════════════════
+
+def test_image_forensics():
+    header("TEST 6 — ImageForensicsAgent")
+    try:
+        from PIL import Image  # noqa
+    except ImportError:
+        print(f"  {SKIP} — Pillow not installed")
+        _results["ImageForensics"] = "SKIP"
+        return
+
+    from Agents.agent_image_forensics import process
+
+    # Plain synthetic image (no EXIF → exif_absent flag expected)
+    img_bytes = _make_jpeg_bytes()
+    result = process(file_bytes=img_bytes, filename="test.jpg", mime_type="image/jpeg")
+
+    check("source_type",   result.source_type,     result.source_type == "image")
+    check("confidence",    result.confidence_score, 0.0 <= result.confidence_score <= 1.0)
+    check("raw_hash",      result.raw_bytes_hash,   len(result.raw_bytes_hash) == 64)
+    ok("anomalies",        result.anomalies_detected)
+    ok("reasoning_count",  len(result.reasoning_notes))
+
+    # Corrupt bytes → graceful degradation (no exception)
+    bad = process(file_bytes=b"not_an_image", filename="bad.jpg", mime_type="image/jpeg")
+    check("corrupt_handled", bad.source_type, bad.source_type == "image")
+
+    print(f"\n  {PASS} — ImageForensicsAgent OK")
+    _results["ImageForensics"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 7 — Evidence Fusion layer
+# ══════════════════════════════════════════════════════════════════
+
+async def test_evidence_fusion():
+    header("TEST 7 — EvidenceFusion layer")
+    from evidence_fusion import fuse_evidence, FusionResult, DecisionEngine, PipelineResult
+    from Agents.claim_extractor import ClaimExtractor
+    from Agents.context_agent import ContextAgent
+    from Agents.source_cred_agent import SourceCredibilityAgent
+    from Agents.network_agent import analyse_network
+    from Agents.linguistic_agent import analyse_linguistics
+
+    nfo = _make_nfo("url")
+    extractor = ClaimExtractor(provider="openai_compat")
+    extraction = await extractor.extract(SAMPLE_TEXT, source_type="url")
+
+    context_agent = ContextAgent(use_mock=True)
+    source_agent  = SourceCredibilityAgent()
+
+    context    = await context_agent.run(nfo, extraction.claims)
+    source     = await source_agent.run(nfo)
+    network    = analyse_network(source_type="url", url="https://example-news.xyz/story",
+                                 extracted_text=SAMPLE_TEXT)
+    linguistic = analyse_linguistics(extracted_text=SAMPLE_TEXT,
+                                     title="Breaking Fusion Energy News",
+                                     source_type="url")
+
+    # Build a mock ClaimVerifyResult (avoids needing a live vector DB)
+    from Agents.claim_verifier import ClaimVerifyResult
+    mock_verify = ClaimVerifyResult(
+        input_type="URL",
+        source_ref="test_source",
+        dedup_hash="a" * 64,
+        quality_passed=True,
+        claims=extraction.claims,
+        verified_claims=[],
+        retrieved_chunks=[],
+        overall_support_score=0.2,
+        overall_contradiction_score=0.6,
+        agent_errors=[],
+    )
+
+    result: FusionResult = fuse_evidence(
+        nfo=nfo,
+        claim_extraction=extraction,
+        claim_verification=mock_verify,
+        source_cred=source,
+        image_forensics=None,   # not an image
+        video_forensics=None,   # not a video
+        context=context,
+        network=network,
+        linguistic=linguistic,
+    )
+
+    check("risk_score",      result.risk_score,      0.0 <= result.risk_score <= 1.0)
+    check("risk_band",       result.risk_band,        result.risk_band in ("GREEN","AMBER","ORANGE","RED"))
+    check("ensemble_score",  result.ensemble_score,   0.0 <= result.ensemble_score <= 1.0)
+    check("bayesian_score",  result.bayesian_score,   0.0 <= result.bayesian_score <= 1.0)
+    check("meta_confidence", result.meta_confidence,  0.0 <= result.meta_confidence <= 1.0)
+    check("signals_count",   len(result.signals),     len(result.signals) == 8)
+    ok("red_flags_count",    len(result.red_flags))
+    ok("key_reasoning",      len(result.key_reasoning))
+
+    # Decision engine
+    engine = DecisionEngine()
+    decision: PipelineResult = engine.decide(result)
+
+    check("action", decision.action,
+          decision.action in ("auto-allow", "flag-review", "auto-block"))
+    check("label",  decision.label,  bool(decision.label))
+    check("audit_trail_keys", list(decision.audit_trail.keys()),
+          "per_agent" in decision.audit_trail)
+
+    ok("decision_action",    decision.action)
+    ok("decision_risk_score", decision.risk_score)
+    ok("requires_human",     decision.requires_human_review)
+
+    print(f"\n  {PASS} — EvidenceFusion + DecisionEngine OK")
+    _results["EvidenceFusion"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 8 — Fusion edge cases
+# ══════════════════════════════════════════════════════════════════
+
+async def test_fusion_edge_cases():
+    header("TEST 8 — Fusion edge cases")
+    from evidence_fusion import fuse_evidence, DecisionEngine
+    from Agents.claim_extractor import ClaimExtractor, ClaimExtractionResult
+    from Agents.claim_verifier import ClaimVerifyResult
+    from Agents.context_agent import ContextAgent
+    from Agents.source_cred_agent import SourceCredibilityAgent
+    from Agents.network_agent import analyse_network
+    from Agents.linguistic_agent import analyse_linguistics
+
+    nfo = _make_nfo("document")
+    extractor = ClaimExtractor(provider="openai_compat")
+
+    # Case A — completely benign content
+    benign_text = "The quarterly earnings report showed stable growth of 3% year-over-year."
+    benign_extract = await extractor.extract(benign_text, source_type="document")
+    context_agent = ContextAgent(use_mock=True)
+    source_agent  = SourceCredibilityAgent()
+    benign_context = await context_agent.run(nfo, benign_extract.claims)
+    benign_source  = await source_agent.run(nfo)
+    benign_network = analyse_network(source_type="document", url="", extracted_text=benign_text)
+    benign_ling    = analyse_linguistics(extracted_text=benign_text, source_type="document")
+
+    benign_verify = ClaimVerifyResult(
+        input_type="DOCUMENT", source_ref="test", dedup_hash="b"*64,
+        quality_passed=True, claims=[], verified_claims=[], retrieved_chunks=[],
+        overall_support_score=0.9, overall_contradiction_score=0.05, agent_errors=[],
+    )
+
+    benign_result = fuse_evidence(
+        nfo=nfo, claim_extraction=benign_extract, claim_verification=benign_verify,
+        source_cred=benign_source, image_forensics=None, video_forensics=None,
+        context=benign_context, network=benign_network, linguistic=benign_ling,
+    )
+    ok("benign_risk_score", benign_result.risk_score)
+    ok("benign_risk_band",  benign_result.risk_band)
+
+    # Case B — all signals fire with high risk
+    high_risk_verify = ClaimVerifyResult(
+        input_type="DOCUMENT", source_ref="test", dedup_hash="c"*64,
+        quality_passed=True, claims=[], verified_claims=[], retrieved_chunks=[],
+        overall_support_score=0.0, overall_contradiction_score=0.95, agent_errors=[],
+    )
+    high_ling = analyse_linguistics(
+        extracted_text=SAMPLE_TEXT * 3,
+        title="SHOCKING SECRET THEY DON'T WANT YOU TO KNOW — share before deleted!!",
+        source_type="url",
+    )
+    from Agents.source_cred_agent import SourceCredibilityResult
+    fake_source = SourceCredibilityResult(
+        source_ref="test", input_type="URL",
+        overall_score=0.05, is_known_fake_news=True,
+        red_flags=["known_fake_news"],
+    )
+    high_network = analyse_network(
+        source_type="url", url="http://1.2.3.4/redirect?r=fake",
+        extracted_text="Send this to everyone! Share before deleted! Forward to 10 friends!",
+    )
+    high_extract = await extractor.extract(SAMPLE_TEXT, source_type="url")
+    high_context = await context_agent.run(nfo, high_extract.claims)
+
+    high_result = fuse_evidence(
+        nfo=nfo, claim_extraction=high_extract, claim_verification=high_risk_verify,
+        source_cred=fake_source, image_forensics=None, video_forensics=None,
+        context=high_context, network=high_network, linguistic=high_ling,
+    )
+    ok("high_risk_score",  high_result.risk_score)
+    ok("high_risk_band",   high_result.risk_band)
+    check("high_risk_elevated", high_result.risk_score,
+          high_result.risk_score > benign_result.risk_score)
+
+    engine = DecisionEngine()
+    benign_decision = engine.decide(benign_result)
+    high_decision   = engine.decide(high_result)
+    ok("benign_action", benign_decision.action)
+    ok("high_action",   high_decision.action)
+
+    print(f"\n  {PASS} — Fusion edge cases OK")
+    _results["FusionEdgeCases"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEST 9 — Full Orchestrator flow (integration)
+# ══════════════════════════════════════════════════════════════════
+
+async def test_orchestrator():
+    header("TEST 9 — Full Orchestrator (integration)")
+
+    # The orchestrator calls Prefect tasks. In test mode we call the underlying
+    # flow directly — Prefect handles execution without a running server.
+    try:
+        from orchestrator import analyse_content
+    except ImportError as e:
+        print(f"  {SKIP} — Could not import orchestrator: {e}")
+        _results["Orchestrator"] = "SKIP"
+        return
+
+    # ── 9a. Document input (no system deps needed) ────────────────
+    print("  Running document flow...")
+    result = await analyse_content(
+        source_ref="smoke_test_doc.txt",
+        input_type="document",
+        file_bytes=SAMPLE_DOC_BYTES,
+    )
+    check("action_valid",  result.action,
+          result.action in ("auto-allow", "flag-review", "auto-block"))
+    check("risk_score",    result.risk_score, 0.0 <= result.risk_score <= 1.0)
+    check("risk_band",     result.risk_band, result.risk_band in ("GREEN","AMBER","ORANGE","RED"))
+    check("has_audit",     result.audit_trail, bool(result.audit_trail))
+    ok("doc_action",       result.action)
+    ok("doc_risk",         result.risk_score)
+
+    # ── 9b. Quality gate rejection path ──────────────────────────
+    print("  Running quality gate rejection path...")
+    bad_result = await analyse_content(
+        source_ref="empty.txt",
+        input_type="document",
+        file_bytes=b"",
+    )
+    check("bad_action", bad_result.action,
+          bad_result.action in ("auto-block", "flag-review"))
+
+    # ── 9c. Image input (requires Pillow) ─────────────────────────
+    try:
+        from PIL import Image as _pil  # noqa
+        print("  Running image flow...")
+        img_bytes = _make_jpeg_bytes(300, 300)
+        img_result = await analyse_content(
+            source_ref="test.jpg",
+            input_type="image",
+            file_bytes=img_bytes,
+        )
+        check("img_action", img_result.action,
+              img_result.action in ("auto-allow","flag-review","auto-block"))
+        ok("img_action",    img_result.action)
+        ok("img_risk",      img_result.risk_score)
+    except ImportError:
+        print(f"  {SKIP} — Pillow not installed, image flow skipped")
+
+    print(f"\n  {PASS} — Orchestrator integration test OK")
+    _results["Orchestrator"] = "PASS"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Runner
+# ══════════════════════════════════════════════════════════════════
+
+async def main():
+    # Unit tests — agents
+    await _run_async("ClaimExtractor",    test_claim_extractor)
+    await _run_async("ContextAgent",      test_context_agent)
+    await _run_async("SourceCredibility", test_source_cred_agent)
+    _run("NetworkAgent",                  test_network_agent)
+    _run("LinguisticAgent",               test_linguistic_agent)
+    _run("ImageForensics",                test_image_forensics)
+
+    # Fusion layer
+    await _run_async("EvidenceFusion",    test_evidence_fusion)
+    await _run_async("FusionEdgeCases",   test_fusion_edge_cases)
+
+    # Full pipeline
+    await _run_async("Orchestrator",      test_orchestrator)
+
+    # ── Summary ──────────────────────────────────────────────────
+    print(f"\n{BOLD}{'='*60}")
+    print("  SUMMARY")
+    print(f"{'='*60}{RESET}")
+    for name, status in _results.items():
+        symbol = {
+            "PASS": PASS, "SKIP": SKIP, "FAIL": FAIL,
+        }.get(status, status)
+        print(f"  {name:<22} {symbol}")
+
+    failed  = [n for n, s in _results.items() if s == "FAIL"]
+    skipped = [n for n, s in _results.items() if s == "SKIP"]
+
+    if failed:
+        print(f"\n{RED}✗ {len(failed)} test(s) FAILED: {', '.join(failed)}{RESET}\n")
+        sys.exit(1)
+    else:
+        note = f"  ({len(skipped)} skipped — missing optional deps)" if skipped else ""
+        print(f"\n{GREEN}✓ All tests passed.{RESET}{note}\n")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
