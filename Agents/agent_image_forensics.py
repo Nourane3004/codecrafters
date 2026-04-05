@@ -444,7 +444,8 @@ def process(
         try:
             claim_result = ExtractedClaim(
                 extracted_text=extracted_text,
-                source_type="image",
+                input_type="image",
+                source_ref=""
             )
             # Sérialisation défensive
             try:

@@ -214,19 +214,25 @@ class ClaimExtractor:
             )
 
     async def _extract_with_openai(self, text: str, source_type: str) -> ClaimExtractionResult:
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Source type: {source_type}\n\nText:\n{text[:12000]}"}
-            ],
-            "temperature": 0.0,
-        }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(f"{self.api_base}/chat/completions", json=payload)
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-        return self._parse_llm_response(raw, "llm")
+        try:
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Source type: {source_type}\n\nText:\n{text[:12000]}"}
+                ],
+                "temperature": 0.0,
+            }
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(f"{self.api_base}/chat/completions", json=payload)
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+            return self._parse_llm_response(raw, "llm")
+        except Exception as e:
+            logger.warning(f"OpenAI-compat LLM unavailable ({e}) — will use heuristic fallback")
+            return ClaimExtractionResult(
+                success=False, extraction_method="failed", error=str(e)
+            )
 
     def _parse_llm_response(self, raw_json: str, method: str) -> ClaimExtractionResult:
         # Nettoyage des markdown
