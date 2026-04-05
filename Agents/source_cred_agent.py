@@ -147,7 +147,7 @@ class SourceCredibilityAgent:
 
     def _extract_domain(self, nfo: Any) -> Optional[str]:
         """Extrait le nom de domaine à partir du NFO."""
-        if nfo.input_type == "URL" and nfo.url_data and nfo.url_data.final_url:
+        if nfo.input_type.value == "url" if hasattr(nfo.input_type, "value") else str(nfo.input_type).upper() == "URL" and nfo.url_data and nfo.url_data.final_url:
             from urllib.parse import urlparse
             parsed = urlparse(nfo.url_data.final_url)
             domain = parsed.netloc
@@ -155,7 +155,7 @@ class SourceCredibilityAgent:
                 domain = domain[4:]
             return domain
         # Pour les autres types, on peut essayer de trouver un domaine dans les métadonnées
-        if nfo.input_type == "IMAGE" and nfo.image_meta and nfo.image_meta.exif:
+        if nfo.input_type.value == "image" if hasattr(nfo.input_type, "value") else str(nfo.input_type).upper() == "IMAGE" and nfo.image_meta and nfo.image_meta.exif:
             # Exemple : exif peut contenir un champ "source" ou "url"
             pass
         return None

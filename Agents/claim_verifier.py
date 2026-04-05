@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 import httpx
 from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.config import Settings
 
 # Import depuis claim_extractor
 from claim_extractor import ExtractedClaim, select_richest_text, ClaimExtractor
@@ -62,11 +61,8 @@ class VectorStore:
     def __init__(self, persist_dir: str = "./chroma_db", collection_name: str = "fact_corpus",
                  embedding_model: str = "all-MiniLM-L6-v2"):
         self._model = SentenceTransformer(embedding_model)
-        self._client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=persist_dir,
-            anonymized_telemetry=False,
-        ))
+        # Modern ChromaDB API (v0.4+): use PersistentClient instead of deprecated Client(Settings(...))
+        self._client = chromadb.PersistentClient(path=persist_dir)
         self._collection = self._client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
@@ -238,19 +234,19 @@ class RAGAgent:
     async def run(self, nfo: Any) -> ClaimVerifyResult:
         errors = []
 
-        if not nfo.text.quality_passed:
-            logger.warning(f"Quality gate failed: {nfo.text.quality_reason}")
+        if not nfo.quality_passed:
+            logger.warning(f"Quality gate failed: {nfo.quality_reason}")
             return ClaimVerifyResult(
                 input_type=nfo.input_type,
                 source_ref=nfo.source_ref,
-                dedup_hash=nfo.text.dedup_hash,
+                dedup_hash=nfo.dedup_hash,
                 quality_passed=False,
                 claims=[],
                 verified_claims=[],
                 retrieved_chunks=[],
                 overall_support_score=0.0,
                 overall_contradiction_score=0.0,
-                agent_errors=[f"Skipped: {nfo.text.quality_reason}"],
+                agent_errors=[f"Skipped: {nfo.quality_reason}"],
             )
 
         text = select_richest_text(nfo)
@@ -284,8 +280,8 @@ class RAGAgent:
         return ClaimVerifyResult(
             input_type=nfo.input_type,
             source_ref=nfo.source_ref,
-            dedup_hash=nfo.text.dedup_hash,
-            quality_passed=nfo.text.quality_passed,
+            dedup_hash=nfo.dedup_hash,
+            quality_passed=nfo.quality_passed,
             claims=claims,
             verified_claims=verified_claims,
             retrieved_chunks=retrieved_chunks,

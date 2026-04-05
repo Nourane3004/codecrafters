@@ -54,14 +54,18 @@ class ClaimExtractionResult(BaseModel):
 def select_richest_text(nfo: Any) -> str:
     """
     Sélectionne la meilleure surface textuelle à partir d'un NormalizedFeatureObject.
-    Supporte les champs: image_meta, url_data, doc_data, video_data.
+    nfo.text is already a plain str — never call .raw_text on it.
+    input_type is an InputType enum — compare with .value or use str().
     """
-    if nfo.input_type == "IMAGE":
+    input_type = nfo.input_type.value if hasattr(nfo.input_type, "value") else str(nfo.input_type)
+    input_type = input_type.upper()
+
+    if input_type == "IMAGE":
         if nfo.image_meta and nfo.image_meta.ocr.raw_text and nfo.image_meta.ocr.confidence >= 0.7:
             return nfo.image_meta.ocr.raw_text
-        return nfo.text.raw_text
+        return nfo.text or ""
 
-    if nfo.input_type == "URL":
+    if input_type == "URL":
         if nfo.url_data and nfo.url_data.raw_text:
             prefix = ""
             if nfo.url_data.meta.title:
@@ -69,19 +73,19 @@ def select_richest_text(nfo: Any) -> str:
             if nfo.url_data.meta.description:
                 prefix += f"Description: {nfo.url_data.meta.description}\n\n"
             return prefix + nfo.url_data.raw_text
-        return nfo.text.raw_text
+        return nfo.text or ""
 
-    if nfo.input_type == "DOCUMENT":
-        if nfo.doc_data and nfo.doc_data.layout_blocks:
-            return "\n\n".join(block.text for block in nfo.doc_data.layout_blocks)
-        return nfo.text.raw_text
+    if input_type == "DOCUMENT":
+        if nfo.document_data and nfo.document_data.text_extract.raw_text:
+            return nfo.document_data.text_extract.raw_text
+        return nfo.text or ""
 
-    if nfo.input_type == "VIDEO":
+    if input_type == "VIDEO":
         if nfo.video_data and nfo.video_data.asr.raw_text:
             return nfo.video_data.asr.raw_text
-        return nfo.text.raw_text
+        return nfo.text or ""
 
-    return nfo.text.raw_text
+    return nfo.text or ""
 
 # =============================================================================
 # Prompt système (identique à la version améliorée)

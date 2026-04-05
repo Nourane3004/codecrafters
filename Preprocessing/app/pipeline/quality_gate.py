@@ -53,12 +53,15 @@ def enrich(nfo: NormalizedFeatureObject) -> NormalizedFeatureObject:
         nfo.language = LANG_MAP.get(lang_code, lang_code)
 
     # ── 3. Content-specific quality checks ──────────────────────
-    if nfo.quality_passed:
-        failed, reason = _content_quality_checks(nfo)
-        if failed:
-            nfo.quality_passed = False
-            nfo.quality_reason = reason
-            return nfo
+    # If the processor already failed the quality gate, respect it.
+    if not nfo.quality_passed:
+        return nfo
+
+    failed, reason = _content_quality_checks(nfo)
+    if failed:
+        nfo.quality_passed = False
+        nfo.quality_reason = reason
+        return nfo
 
     # ── 4. Preprocessing confidence score ───────────────────────
     score = _compute_confidence(nfo)
@@ -67,8 +70,9 @@ def enrich(nfo: NormalizedFeatureObject) -> NormalizedFeatureObject:
         nfo.quality_reason = f"Preprocessing confidence too low ({score:.0%})"
         return nfo
 
-    nfo.quality_passed = True
-    nfo.quality_reason = f"OK (confidence {score:.0%})"
+    # Only mark passed if not already failed upstream
+    if nfo.quality_passed:
+        nfo.quality_reason = f"OK (confidence {score:.0%})"
     return nfo
 
 
