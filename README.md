@@ -226,3 +226,9 @@ sentence-transformers	Claim embedding	all-MiniLM-L6-v2 – fast on CPU, 384‑di
 ChromaDB	Vector store	Python‑native, persistent, no external server
 Groq (LLM)	Claim extraction & NLI	500 tokens/sec on LLaMA‑3.3‑70B – real‑time inference
 python-whois	Source credibility	Complete WHOIS parser for 100+ TLDs
+
+
+Presentation LIKNK: (technical+business)
+https://prezi.com/view/G5iyzmlfa0QaNA0p3Qjl/?referral_token=GkMp8jlnB3FN&fbclid=IwY2xjawQ_EhxleHRuA2FlbQIxMABicmlkETFIWE1BSWpGNUFLZzM3b0Vjc3J0YwZhcHBfaWQQMjIyMDM5MTc4ODIwMDg5MgABHnEMA6tHJF-fOWuq0rxHHn0ld6ZLtpv8-6MsF1fjsXW2mUS53ABXd67g2b9N_aem_rMV8sVyD9XzcC_xOfwRBbQ
+
+
